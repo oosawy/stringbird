@@ -1,47 +1,155 @@
+use clap::Parser as _;
+use core::panic;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
+use std::sync::Arc;
+use swc::{Compiler, PrintArgs};
 use swc_common::comments::{Comment, CommentKind, Comments, SingleThreadedComments};
 use swc_common::sync::Lrc;
 use swc_common::{
     errors::{ColorConfig, Handler},
     SourceMap,
 };
-use swc_common::{SourceMapper, Span};
-use swc_ecma_ast::Lit;
-use swc_ecma_parser::PResult;
+use swc_common::{AstNode, FileName, SourceMapper, Span};
+use swc_ecma_ast::{EsVersion, Expr, Lit, Str, Tpl};
 use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax};
-use swc_ecma_visit::{Visit, VisitWith};
+use swc_ecma_parser::{PResult, TsSyntax};
+use swc_ecma_visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
-// Represents a mapping of keys "#123" to string values "foo".
-type StringMap = HashMap<String, String>;
+#[derive(Debug, clap::Parser)]
+#[clap()]
+struct Args {
+    #[clap(subcommand)]
+    subcommand: SubCommand,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum SubCommand {
+    Extract {
+        #[clap(name = "files", required = true)]
+        files: Vec<String>,
+    },
+    Apply {
+        #[clap(name = "files", required = true)]
+        files: Vec<String>,
+    },
+}
 
 fn main() {
-    let inputs = std::env::args().skip(1).collect::<Vec<_>>();
+    let args = Args::parse();
 
+    match args.subcommand {
+        SubCommand::Extract { files } => extract(files),
+        SubCommand::Apply { files } => apply(files),
+    }
+}
+
+mod bird_format {
+    use super::StringMap;
+    use std::{
+        collections::HashMap,
+        io::{BufRead, BufReader, Read, Result, Write},
+    };
+
+    fn encode_string(string: &str) -> String {
+        let mut encoded = String::new();
+        for c in string.chars() {
+            match c {
+                '\\' => encoded.push_str("\\\\"),
+                '\n' => encoded.push_str("\\n"),
+                _ => encoded.push(c),
+            }
+        }
+        encoded
+    }
+
+    fn decode_string(string: &str) -> String {
+        let mut decoded = String::new();
+        let mut chars = string.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                match chars.next() {
+                    Some('n') => decoded.push('\n'),
+                    Some('\\') => decoded.push('\\'),
+                    _ => decoded.push(c),
+                }
+            } else {
+                decoded.push(c);
+            }
+        }
+        decoded
+    }
+
+    pub fn parse<'a>(reader: impl Read) -> Result<StringMap> {
+        let mut dict = HashMap::new();
+        let reader = BufReader::new(reader);
+
+        for line in reader.lines() {
+            let line = line?;
+            let mut parts = line.splitn(2, '=');
+            let key = parts.next().unwrap();
+            let value = parts.next().unwrap();
+            println!("{}={}", key, value);
+            dict.insert(key.to_string(), decode_string(value));
+        }
+
+        Ok(dict)
+    }
+
+    pub fn format(dict: StringMap, writer: &mut impl Write) -> Result<()> {
+        for (k, v) in dict.iter() {
+            writer.write(&format!("{}={}\n", k, encode_string(v)).as_bytes())?;
+        }
+
+        Ok(())
+    }
+}
+
+fn extract(files: Vec<String>) {
     let mut dict = HashMap::new();
 
-    for input in inputs {
-        println!("Parsing {}", input);
+    for file in files {
+        println!("Parsing {}", file);
 
-        match parse(&Path::new(&input)) {
-            Ok(map) => dict.extend(map),
-            Err(e) => eprintln!("Error: {:?}", e),
-        }
+        let map = pick_strings(&Path::new(&file)).expect("failed to parse file");
+        dict.extend(map);
     }
 
     let mut output =
         BufWriter::new(File::create("stringbird").expect("failed to create output file"));
 
-    for (k, v) in dict.iter() {
-        output.write(format!("{}={}\n", k, v).as_bytes()).unwrap();
-    }
+    bird_format::format(dict, &mut output).expect("failed to write output");
 
     println!("Output written to stringbird");
 }
 
-fn parse(input: &Path) -> PResult<StringMap> {
+fn apply(files: Vec<String>) {
+    let mut dict = HashMap::new();
+
+    let input = BufReader::new(File::open("stringbird").expect("failed to open input file"));
+
+    let map = bird_format::parse(input).expect("failed to parse input");
+    dict.extend(map);
+
+    for file in files {
+        println!("Applying to {}", file);
+
+        apply_strings(&Path::new(&file), dict.clone()).expect("failed to apply strings");
+    }
+}
+
+// Represents a mapping of keys "#FOO" to string values "foo".
+type StringMap = HashMap<String, String>;
+
+fn parse_file(
+    input: &Path,
+) -> PResult<(
+    swc_ecma_ast::Program,
+    Lrc<SourceMap>,
+    SingleThreadedComments,
+)> {
     let cm: Lrc<SourceMap> = Default::default();
     let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
 
@@ -52,8 +160,11 @@ fn parse(input: &Path) -> PResult<StringMap> {
     let comments = SingleThreadedComments::default();
 
     let lexer = Lexer::new(
-        Syntax::Es(Default::default()),
-        Default::default(),
+        Syntax::Typescript(TsSyntax {
+            tsx: true,
+            ..Default::default()
+        }),
+        EsVersion::latest(),
         StringInput::from(&*fm),
         Some(&comments),
     );
@@ -64,24 +175,102 @@ fn parse(input: &Path) -> PResult<StringMap> {
         e.into_diagnostic(&handler).emit();
     }
 
+    Ok((parser.parse_program()?, cm, comments))
+}
+
+fn parse_string(code: String, filename: &str) -> PResult<Box<Expr>> {
+    let cm: Lrc<SourceMap> = Default::default();
+    let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
+
+    let fm = cm.new_source_file(FileName::Custom(filename.into()).into(), code);
+
+    let comments = SingleThreadedComments::default();
+
+    let lexer = Lexer::new(
+        Syntax::Typescript(TsSyntax {
+            tsx: true,
+            ..Default::default()
+        }),
+        EsVersion::latest(),
+        StringInput::from(&*fm),
+        Some(&comments),
+    );
+
+    let mut parser = Parser::new_from(lexer);
+
+    for e in parser.take_errors() {
+        e.into_diagnostic(&handler).emit();
+    }
+
+    parser.parse_expr()
+}
+
+fn pick_strings(input: &Path) -> PResult<StringMap> {
+    let (mut program, cm, comments) = parse_file(input)?;
+
     let mut strings = HashMap::new();
 
     let visitor = &mut StringBird {
+        filename: input.file_name().unwrap().to_str().unwrap(),
         cm: &cm,
         comments: &comments,
+        mode: BirdMode::Extract,
         strings: &mut strings,
     };
 
-    parser.parse_program()?.visit_with(visitor);
+    program.visit_mut_with(visitor);
 
     Ok(strings)
 }
 
+fn apply_strings(input: &Path, strings: StringMap) -> PResult<()> {
+    let (mut program, cm, comments) = parse_file(input)?;
+
+    let mut strings = strings;
+
+    let visitor = &mut StringBird {
+        filename: input.file_name().unwrap().to_str().unwrap(),
+        cm: &cm,
+        comments: &comments,
+        mode: BirdMode::Apply,
+        strings: &mut strings,
+    };
+
+    program.visit_mut_with(visitor);
+
+    let compiler = Compiler::new(Default::default());
+
+    let result = compiler
+        .print(
+            &program,
+            PrintArgs {
+                comments: Some(&comments),
+                source_map: swc::config::SourceMapsConfig::Bool(false),
+                ..Default::default()
+            },
+        )
+        .expect("failed to print program");
+
+    File::create(input)
+        .expect("failed to create output file")
+        .write_all(result.code.as_bytes())
+        .expect("failed to write output");
+
+    Ok(())
+}
+
+enum BirdMode {
+    Extract,
+    Apply,
+}
+
 struct StringBird<'a> {
+    filename: &'a str,
     cm: &'a SourceMap,
     comments: &'a SingleThreadedComments,
 
-    strings: &'a mut HashMap<String, String>,
+    mode: BirdMode,
+    strings: &'a mut StringMap,
 }
 
 impl StringBird<'_> {
@@ -101,20 +290,56 @@ impl StringBird<'_> {
     }
 }
 
-impl Visit for StringBird<'_> {
-    fn visit_lit(&mut self, node: &Lit) {
+impl VisitMut for StringBird<'_> {
+    fn visit_mut_lit(&mut self, node: &mut Lit) {
         if let Lit::Str(s) = node {
             if let Some(c) = self.get_mark_comment(self.comments, s.span) {
-                self.strings
-                    .insert(c.text[1..].to_string(), self.get_source_text(s.span));
+                let key = &c.text[1..];
+                let value = self.get_source_text(s.span);
+
+                match self.mode {
+                    BirdMode::Extract => {
+                        self.strings.insert(key.to_string(), value);
+                    }
+                    BirdMode::Apply => {
+                        if let Some(string) = self.strings.get(key) {
+                            if value != *string {
+                                match *parse_string(string.to_string(), self.filename).unwrap() {
+                                    Expr::Lit(Lit::Str(parsed)) => {
+                                        *s = parsed;
+                                    }
+                                    _ => panic!("expected string literal"),
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
 
-    fn visit_tpl(&mut self, node: &swc_ecma_ast::Tpl) {
+    fn visit_mut_tpl(&mut self, node: &mut Tpl) {
         if let Some(c) = self.get_mark_comment(self.comments, node.span) {
-            self.strings
-                .insert(c.text[1..].to_string(), self.get_source_text(node.span));
+            let key = &c.text[1..];
+            let value = self.get_source_text(node.span);
+
+            match self.mode {
+                BirdMode::Extract => {
+                    self.strings.insert(key.to_string(), value);
+                }
+                BirdMode::Apply => {
+                    if let Some(string) = self.strings.get(key) {
+                        if value != *string {
+                            match *parse_string(string.to_string(), self.filename).unwrap() {
+                                Expr::Tpl(parsed) => {
+                                    *node = parsed;
+                                }
+                                _ => panic!("expected template literal"),
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
