@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
-use std::sync::Arc;
+use swc::config::SourceMapsConfig;
 use swc::{Compiler, PrintArgs};
 use swc_common::comments::{Comment, CommentKind, Comments, SingleThreadedComments};
 use swc_common::sync::Lrc;
@@ -12,11 +12,11 @@ use swc_common::{
     errors::{ColorConfig, Handler},
     SourceMap,
 };
-use swc_common::{AstNode, FileName, SourceMapper, Span};
-use swc_ecma_ast::{EsVersion, Expr, Lit, Str, Tpl};
+use swc_common::{FileName, SourceMapper, Span};
+use swc_ecma_ast::{EsVersion, Expr, Lit, Tpl};
 use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax};
 use swc_ecma_parser::{PResult, TsSyntax};
-use swc_ecma_visit::{Visit, VisitMut, VisitMutWith, VisitWith};
+use swc_ecma_visit::{VisitMut, VisitMutWith};
 
 #[derive(Debug, clap::Parser)]
 #[clap()]
@@ -238,14 +238,14 @@ fn apply_strings(input: &Path, strings: StringMap) -> PResult<()> {
 
     program.visit_mut_with(visitor);
 
-    let compiler = Compiler::new(Default::default());
+    let compiler = Compiler::new(cm);
 
     let result = compiler
         .print(
             &program,
             PrintArgs {
                 comments: Some(&comments),
-                source_map: swc::config::SourceMapsConfig::Bool(false),
+                source_map: SourceMapsConfig::Bool(false),
                 ..Default::default()
             },
         )
@@ -305,7 +305,8 @@ impl VisitMut for StringBird<'_> {
                         if let Some(string) = self.strings.get(key) {
                             if value != *string {
                                 match *parse_string(string.to_string(), self.filename).unwrap() {
-                                    Expr::Lit(Lit::Str(parsed)) => {
+                                    Expr::Lit(Lit::Str(mut parsed)) => {
+                                        parsed.span = s.span;
                                         *s = parsed;
                                     }
                                     _ => panic!("expected string literal"),
@@ -331,7 +332,8 @@ impl VisitMut for StringBird<'_> {
                     if let Some(string) = self.strings.get(key) {
                         if value != *string {
                             match *parse_string(string.to_string(), self.filename).unwrap() {
-                                Expr::Tpl(parsed) => {
+                                Expr::Tpl(mut parsed) => {
+                                    parsed.span = node.span;
                                     *node = parsed;
                                 }
                                 _ => panic!("expected template literal"),
